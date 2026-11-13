@@ -41,6 +41,8 @@ static WindowPtr gWin;
 static MenuHandle gFileMenu;
 static BitMap gTiles;
 static unsigned short gTileBits[16][T_COUNT];
+static BitMap gComp;             /* compass sprites: 20 cells, 8 pixels apart */
+static unsigned char gCompBits[8][20];
 static Ptr gMapBase = 0L;       /* screen address of the map's top-left, or 0 */
 static short gShadow[VIEW_H][VIEW_W];
 static short gFull = 1;         /* next map draw must look at every cell */
@@ -231,37 +233,160 @@ static void flashMap(void)
 
 /* ------------------------------------------------------------ compass */
 
-static void pipRect(short dir, Rect *r)
+/* Compass art, 7x7. The four arrow shapes are drawn once pointing north
+   and north-east; the other six directions are made by turning them a
+   quarter turn at a time. Hollow arrows are the resting state, and the
+   filled one is where the whistle last came from. */
+static const char *kCompArt[8][7] = {
+/* hollow, north */ {
+".......",
+"...#...",
+"..#.#..",
+".#...#.",
+"#.....#",
+"#######",
+"......." },
+/* hollow, north-east */ {
+".######",
+"..#...#",
+"...#..#",
+"....#.#",
+".....##",
+"......#",
+"......." },
+/* filled, north */ {
+".......",
+"...#...",
+"..###..",
+".#####.",
+"#######",
+"#######",
+"......." },
+/* filled, north-east */ {
+".######",
+"..#####",
+"...####",
+"....###",
+".....##",
+"......#",
+"......." },
+/* N */ {
+"#...#..",
+"##..#..",
+"#.#.#..",
+"#..##..",
+"#...#..",
+".......",
+"......." },
+/* E */ {
+"#####..",
+"#......",
+"####...",
+"#......",
+"#####..",
+".......",
+"......." },
+/* S */ {
+".####..",
+"#......",
+".###...",
+"....#..",
+"####...",
+".......",
+"......." },
+/* W */ {
+"#...#..",
+"#...#..",
+"#.#.#..",
+"##.##..",
+"#...#..",
+".......",
+"......." }
+};
+
+#define COMP_CX 490
+#define COMP_CY (MAP_H + 17)
+
+static void storeSprite(short idx, char cell[7][7])
 {
-    static const short ox[8] = { 0, 8, 11, 8, 0, -8, -11, -8 };
-    static const short oy[8] = { -11, -8, 0, 8, 11, 8, 0, -8 };
-    short cx, cy;
-    cx = (short)(490 + ox[dir]);
-    cy = (short)(MAP_H + 17 + oy[dir]);
-    SetRect(r, (short)(cx - 3), (short)(cy - 3), (short)(cx + 3), (short)(cy + 3));
+    short r, c;
+    unsigned char bits;
+    for (r = 0; r < 7; r++) {
+        bits = 0;
+        for (c = 0; c < 7; c++)
+            if (cell[r][c] == '#') bits = (unsigned char)(bits | (0x80 >> c));
+        gCompBits[r][idx] = bits;
+    }
+}
+
+static void buildCompass(void)
+{
+    char cell[7][7], turned[7][7];
+    short shape, d, r, c;
+
+    /* Sprites 0..7 are the hollow arrows by direction, 8..15 the filled
+       ones, 16..19 the letters N E S W. */
+    for (shape = 0; shape < 4; shape++) {
+        for (r = 0; r < 7; r++)
+            for (c = 0; c < 7; c++)
+                cell[r][c] = kCompArt[shape][r][c];
+        for (d = (short)(shape & 1); d < 8; d += 2) {
+            storeSprite((short)((shape < 2 ? 0 : 8) + d), cell);
+            for (r = 0; r < 7; r++)             /* quarter turn clockwise */
+                for (c = 0; c < 7; c++)
+                    turned[r][c] = cell[6 - c][r];
+            for (r = 0; r < 7; r++)
+                for (c = 0; c < 7; c++)
+                    cell[r][c] = turned[r][c];
+        }
+    }
+    for (shape = 4; shape < 8; shape++) {
+        for (r = 0; r < 7; r++)
+            for (c = 0; c < 7; c++)
+                cell[r][c] = kCompArt[shape][r][c];
+        storeSprite((short)(12 + shape), cell);
+    }
+    gComp.baseAddr = (Ptr)gCompBits;
+    gComp.rowBytes = 20;
+    SetRect(&gComp.bounds, 0, 0, 160, 8);
+}
+
+static void compSprite(short idx, short x, short y, short w, short h)
+{
+    Rect src, dst;
+    SetRect(&src, (short)(idx * 8), 0, (short)(idx * 8 + w), h);
+    SetRect(&dst, x, y, (short)(x + w), (short)(y + h));
+    CopyBits(&gComp, &gWin->portBits, &src, &dst, srcCopy, 0L);
+}
+
+static void arrowRect(short dir, Rect *r)
+{
+    /* Top-left corner of each direction's 7x7 box, from the centre. */
+    static const short ox[8] = { -3, 4, 5, 4, -3, -10, -11, -10 };
+    static const short oy[8] = { -11, -10, -3, 4, 5, 4, -3, -10 };
+    SetRect(r, (short)(COMP_CX + ox[dir]), (short)(COMP_CY + oy[dir]),
+            (short)(COMP_CX + ox[dir] + 7), (short)(COMP_CY + oy[dir] + 7));
 }
 
 static void drawCompass(short flash)
 {
     Rect r;
-    short d, k;
+    short d, k, lit;
 
     SetRect(&r, STRIP_R + 1, MAP_H + 1, WIN_W, WIN_H);
     EraseRect(&r);
-    SetRect(&r, 474, MAP_H + 1, 507, MAP_H + 34);
-    FrameOval(&r);
-    for (d = 0; d < 8; d++) {               /* a small mark at each heading */
-        pipRect(d, &r);
-        InsetRect(&r, 2, 2);
-        PaintRect(&r);
-    }
-    MoveTo(490, MAP_H + 12);                /* north gets a longer tick */
-    LineTo(490, MAP_H + 17);
-    if (gTitle) return;
+    compSprite(16, COMP_CX - 2, COMP_CY - 16, 5, 5);    /* N */
+    compSprite(17, COMP_CX + 12, COMP_CY - 2, 5, 5);    /* E */
+    compSprite(18, COMP_CX - 2, COMP_CY + 12, 5, 5);    /* S */
+    compSprite(19, COMP_CX - 16, COMP_CY - 2, 5, 5);    /* W */
 
-    pipRect(g.whistleDir, &r);              /* where the whistle last came from */
-    PaintRect(&r);
-    if (flash) {
+    lit = (short)(gTitle ? -1 : g.whistleDir);
+    for (d = 0; d < 8; d++) {
+        arrowRect(d, &r);
+        compSprite((short)(d == lit ? 8 + d : d), r.left, r.top, 7, 7);
+    }
+    if (flash && lit >= 0) {
+        arrowRect(lit, &r);
         for (k = 0; k < 6; k++) {
             waitTicks(5);
             InvertRect(&r);
@@ -529,6 +654,7 @@ int main(void)
     }
 
     buildTiles();
+    buildCompass();
     drawTitle();
 
     while (!gQuit) {

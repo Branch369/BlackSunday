@@ -59,9 +59,9 @@ HOW TO PLAY
   flashes when something hurts you.
 
   The compass in the corner is how you find the depot. Every twenty
-  turns a train whistle blows and one mark on the compass flashes: that
-  is the way to go. The mark stays lit until the next whistle. North
-  is the top of the screen.
+  turns a train whistle blows and one of its eight arrows flashes: that
+  is the way to go. That arrow stays filled in until the next whistle;
+  the others are hollow. North is the top of the screen.
 
 
 BUILDING WITH RETRO68 (on a PC)
