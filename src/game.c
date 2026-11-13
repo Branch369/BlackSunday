@@ -29,6 +29,19 @@ typedef struct {
 
 static Lot lotCache;
 
+/* Tiles already worked out for the cells on screen. The town never changes
+   except when an item is picked up, so each cell is computed at most once
+   per screen. -1 means not known yet. */
+static signed char vcache[VIEW_H][VIEW_W];
+
+static void cacheClear(void)
+{
+    s16 i, j;
+    for (i = 0; i < VIEW_H; i++)
+        for (j = 0; j < VIEW_W; j++)
+            vcache[i][j] = -1;
+}
+
 /* ------------------------------------------------------------ helpers */
 
 static u32 rnd(void)
@@ -237,6 +250,10 @@ static s16 isTaken(s32 x, s32 y)
 
 static void markTaken(s32 x, s32 y)
 {
+    s32 vx, vy;
+    vx = x - g.viewX;
+    vy = y - g.viewY;
+    if (vx >= 0 && vx < VIEW_W && vy >= 0 && vy < VIEW_H) vcache[vy][vx] = -1;
     g.takenX[g.takenHead] = x;
     g.takenY[g.takenHead] = y;
     g.takenHead = (s16)((g.takenHead + 1) % MAX_TAKEN);
@@ -363,6 +380,7 @@ static s16 nextTo(Mon *m)
 static void hurt(s16 n, const char *why)
 {
     g.health = (s16)(g.health - n);
+    g.hit = 1;
     say(why);
 }
 
@@ -497,29 +515,29 @@ static void enterLot(void)
 
 /* ------------------------------------------------------------ turns */
 
-static const char *depotDir(void)
+static s16 depotDir(void)
 {
     s32 dx, dy, ax, ay;
     dx = (g.depotLX * LOT_W + 8) - g.px;
     dy = (g.depotLY * LOT_H + 4) - g.py;
     ax = labs32(dx);
     ay = labs32(dy);
-    if (ax > 2 * ay) return dx > 0 ? "east" : "west";
-    if (ay > 2 * ax) return dy > 0 ? "south" : "north";
-    if (dx > 0) return dy > 0 ? "south-east" : "north-east";
-    return dy > 0 ? "south-west" : "north-west";
+    if (ax > 2 * ay) return (s16)(dx > 0 ? 2 : 6);
+    if (ay > 2 * ax) return (s16)(dy > 0 ? 4 : 0);
+    if (dx > 0) return (s16)(dy > 0 ? 3 : 1);
+    return (s16)(dy > 0 ? 5 : 7);
 }
 
 static void whistle(void)
 {
-    say("A train whistle, far off to the");
-    say(depotDir());
-    sCat(g.msg, ".", MSG_LEN);
+    g.whistleDir = depotDir();
+    g.whistled = 1;
 }
 
 static void refresh(void)
 {
     Lot L;
+    s32 vx, vy;
     s16 t;
 
     t = baseTile(g.px, g.py);
@@ -531,8 +549,13 @@ static void refresh(void)
         g.inY0 = L.ly * LOT_H + L.by0;
         g.inY1 = L.ly * LOT_H + L.by1;
     }
-    g.viewX = fdiv(g.px, VIEW_W) * VIEW_W;
-    g.viewY = fdiv(g.py, VIEW_H) * VIEW_H;
+    vx = fdiv(g.px, VIEW_W) * VIEW_W;
+    vy = fdiv(g.py, VIEW_H) * VIEW_H;
+    if (vx != g.viewX || vy != g.viewY) {
+        g.viewX = vx;
+        g.viewY = vy;
+        cacheClear();
+    }
 }
 
 static void endTurn(void)
@@ -553,9 +576,12 @@ static void endTurn(void)
         g.lungs = (s16)(g.lungs + (g.storm >= 2 ? 3 : 2));
         if (g.lungs >= 100) {
             g.lungs = 100;
-            if (g.turn & 1) hurt(1, "You are choking on dust.");
+            if (g.turn & 1)
+                hurt(1, g.rags > 0 ? "Choking! Press R for a rag."
+                                   : "You are choking on dust.");
         } else if (g.lungs >= 75 && g.turn % 4 == 0) {
-            say("You cough up mud.");
+            say(g.rags > 0 ? "You cough up mud. R: use a rag."
+                           : "You cough up mud. Get under a roof.");
         }
     }
 
@@ -587,7 +613,11 @@ static void endTurn(void)
         g.state = ST_DEAD;
         return;
     }
-    if (g.turn % 25 == 0 && g.msg[0] == 0) whistle();
+    if (g.health <= 2 && g.bandages > 0 && g.turn % 3 == 0) say("B: bandage.");
+    if (g.turn % 20 == 0) {
+        whistle();
+        if (g.msg[0] == 0) say("A train whistle.");
+    }
 }
 
 static void pickUp(void)
@@ -678,6 +708,8 @@ void G_Command(s16 cmd)
 {
     if (g.state != ST_PLAY) return;
     g.msg[0] = 0;
+    g.hit = 0;
+    g.whistled = 0;
 
     if (g.aiming) {
         g.aiming = 0;
@@ -736,6 +768,7 @@ void G_New(u32 seed)
     p = (char *)&g;
     for (n = 0; n < (s32)sizeof(Game); n++) p[n] = 0;
     lotCache.valid = 0;
+    cacheClear();
 
     g.seed = seed;
     g.rng = seed ^ (u32)0xA5A5A5A5UL;
@@ -764,7 +797,7 @@ void G_New(u32 seed)
     g.state = ST_PLAY;
     markLot(0, 0);
     refresh();
-    say("Nine days of dust.");
+    say("Nine days of dust. A train whistle, far off: watch the compass.");
     whistle();
 }
 
@@ -773,27 +806,72 @@ void G_New(u32 seed)
 s16 G_Cell(s16 vx, s16 vy)
 {
     s32 x, y;
-    s16 t, mi;
+    s16 dx, dy, t, mi, vis;
     u16 u;
 
     x = g.viewX + vx;
     y = g.viewY + vy;
-    if (x == g.px && y == g.py) return T_PLAYER;
+    dx = (s16)(x - g.px);
+    dy = (s16)(y - g.py);
+    if (dx == 0 && dy == 0) return T_PLAYER;
 
-    if (!cellVisible(x, y)) {
-        /* Dust. A cheap 16-bit mix picks one of three textures, and a few
-           cells change texture each turn so the storm never sits still. */
-        u = (u16)((u16)x * 31u + (u16)y * 17u);
-        u = (u16)(u ^ (u >> 5));
-        if (((u >> 4) & 15) == (u16)(g.turn & 15)) u++;
-        return (s16)(T_DUST0 + u % 3);
+    /* Everything here is 16-bit multiplies and 32-bit adds and compares,
+       which a 68000 does natively. No long multiply, no divide. */
+    if (g.indoors) {
+        vis = (s16)((x >= g.inX0 && x <= g.inX1 && y >= g.inY0 && y <= g.inY1) ||
+                    (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1));
+    } else {
+        vis = (s16)(dx * dx + dy * dy <= g.vis * g.vis + g.vis);
     }
 
-    t = G_TileAt(x, y);
+    if (!vis) {
+        /* Dust: one of three textures, fixed per cell. */
+        u = (u16)((u16)x * 31u + (u16)y * 17u);
+        u = (u16)(u ^ (u >> 5));
+        u = (u16)((u >> 7) & 3);
+        return (s16)(T_DUST0 + (u == 3 ? 0 : u));
+    }
+
+    t = vcache[vy][vx];
+    if (t < 0) {
+        t = G_TileAt(x, y);
+        vcache[vy][vx] = (signed char)t;
+    }
     if (!g.indoors && isInside(t)) return T_ROOF;   /* roofs hide what is inside */
     mi = monAt(x, y);
     if (mi >= 0) return (s16)(T_HUSK + g.mon[mi].kind - 1);
     return t;
+}
+
+/* The smallest box of screen cells that can show anything but dust this
+   turn. The front end redraws this box and last turn's box, and nothing
+   else. */
+void G_DirtyBox(s16 *x0, s16 *y0, s16 *x1, s16 *y1)
+{
+    s16 px, py, a0, b0, a1, b1;
+
+    px = (s16)(g.px - g.viewX);
+    py = (s16)(g.py - g.viewY);
+    if (g.indoors) {
+        a0 = (s16)(g.inX0 - g.viewX);
+        a1 = (s16)(g.inX1 - g.viewX);
+        b0 = (s16)(g.inY0 - g.viewY);
+        b1 = (s16)(g.inY1 - g.viewY);
+        if (px - 1 < a0) a0 = (s16)(px - 1);
+        if (px + 1 > a1) a1 = (s16)(px + 1);
+        if (py - 1 < b0) b0 = (s16)(py - 1);
+        if (py + 1 > b1) b1 = (s16)(py + 1);
+    } else {
+        a0 = (s16)(px - g.vis);
+        a1 = (s16)(px + g.vis);
+        b0 = (s16)(py - g.vis);
+        b1 = (s16)(py + g.vis);
+    }
+    if (a0 < 0) a0 = 0;
+    if (b0 < 0) b0 = 0;
+    if (a1 > VIEW_W - 1) a1 = VIEW_W - 1;
+    if (b1 > VIEW_H - 1) b1 = VIEW_H - 1;
+    *x0 = a0; *y0 = b0; *x1 = a1; *y1 = b1;
 }
 
 void G_Status(char *buf)
@@ -806,5 +884,6 @@ void G_Status(char *buf)
     sCat(buf, "  RAGS ", 80);   sNum(buf, g.rags, 80);
     sCat(buf, "  BANDAGES ", 80); sNum(buf, g.bandages, 80);
     sCat(buf, g.lamp ? "  LAMP ON" : "  LAMP OFF", 80);
-    sCat(buf, g.indoors ? "  (sheltered)" : "", 80);
+    sCat(buf, "  WHISTLE ", 80);
+    sNum(buf, g.whistleDir, 80);
 }

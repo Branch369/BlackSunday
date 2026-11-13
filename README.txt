@@ -11,15 +11,21 @@ flat however far you walk.
 
 STATUS - READ THIS FIRST
 
+  Version 2. The first version was built with Retro68 (GCC 16.1) on
+  GitHub and played in the Infinite Mac emulator as a Mac Plus.
+
   Tested:      the game logic (src/game.c, src/tiles.c), on a modern
-               machine: strict C89 compile, 2,000 seeds checked for a
+               machine: strict C89 compile, seeds checked for a
                walkable route to the depot, random-input fuzzing with
-               memory checking, and a simple bot that wins about a
-               third of its games.
-  NOT tested:  src/main_mac.c, the Macintosh front end. It has never
-               been compiled or run. Expect a typo or a header name to
-               fix on the first build. The compiler error will say
-               where.
+               memory checking, a simple bot that wins about a third
+               of its games, and a check that the new partial screen
+               redraw always matches a full redraw.
+  NOT tested:  this version of src/main_mac.c. The compass, the bars,
+               the damage flash and the faster drawing are new and have
+               not been compiled or run on a Mac yet.
+
+  If the map ever draws as garbage, set DIRECT_BLIT to 0 near the top
+  of src/main_mac.c. That returns to the slower, safer drawing path.
 
 
 HOW TO PLAY
@@ -45,7 +51,17 @@ HOW TO PLAY
               way you last tried to walk. Turning toward a wall or a
               fence costs no time.
 
-  A train whistle now and then tells you which way the depot is.
+  THE SCREEN
+
+  The strip under the map shows health as five blocks, lungs as a
+  meter, and what you are carrying. When it turns black you are in
+  trouble: lungs at 75% or more, or health at 2 or less. The whole map
+  flashes when something hurts you.
+
+  The compass in the corner is how you find the depot. Every twenty
+  turns a train whistle blows and one mark on the compass flashes: that
+  is the way to go. The mark stays lit until the next whistle. North
+  is the top of the screen.
 
 
 BUILDING WITH RETRO68 (on a PC)

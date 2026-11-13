@@ -196,6 +196,33 @@ static void botTurn(void)
     G_Command((s16)CMD[best]);
 }
 
+/* Mirrors the front end's drawMap: redraw only last turn's box and this
+   turn's box, then check the result against a full scan of the screen. */
+static short shadow[VIEW_H][VIEW_W];
+static s16 pb[4];
+static s32 sVX, sVY;
+static int haveShadow;
+
+static void incDraw(unsigned seed)
+{
+    s16 n[4], x0, y0, x1, y1, vx, vy;
+    int full = !haveShadow || sVX != g.viewX || sVY != g.viewY;
+    G_DirtyBox(&n[0], &n[1], &n[2], &n[3]);
+    if (full) { x0 = 0; y0 = 0; x1 = VIEW_W - 1; y1 = VIEW_H - 1; }
+    else {
+        x0 = n[0] < pb[0] ? n[0] : pb[0]; y0 = n[1] < pb[1] ? n[1] : pb[1];
+        x1 = n[2] > pb[2] ? n[2] : pb[2]; y1 = n[3] > pb[3] ? n[3] : pb[3];
+    }
+    memcpy(pb, n, sizeof pb); sVX = g.viewX; sVY = g.viewY; haveShadow = 1;
+    for (vy = y0; vy <= y1; vy++) for (vx = x0; vx <= x1; vx++) shadow[vy][vx] = G_Cell(vx, vy);
+    for (vy = 0; vy < VIEW_H; vy++) for (vx = 0; vx < VIEW_W; vx++)
+        if (shadow[vy][vx] != G_Cell(vx, vy)) {
+            printf("seed %u turn %d: stale cell %d,%d (shown %d, should be %d)\n",
+                   seed, (int)g.turn, vx, vy, shadow[vy][vx], G_Cell(vx, vy));
+            exit(1);
+        }
+}
+
 int main(int argc, char **argv)
 {
     int n, i, t;
@@ -223,9 +250,11 @@ int main(int argc, char **argv)
         for (i = 1; i <= n; i++) {
             G_New((u32)i * 40503u + 7u);
             invariants(i);
+            haveShadow = 0; incDraw(i);
             for (t = 0; t < 4000 && g.state == ST_PLAY; t++) {
                 G_Command((s16)(1 + rand() % 9));
                 invariants(i);
+                incDraw(i);
             }
             if (g.state == ST_DEAD) dead++;
             if (g.state == ST_WON) won++;
@@ -240,7 +269,8 @@ int main(int argc, char **argv)
             G_New((u32)i * 7919u + 13u);
             buildDist();
             resting = 0;
-            for (t = 0; t < 5000 && g.state == ST_PLAY; t++) { botTurn(); invariants(i); }
+            haveShadow = 0; incDraw(i);
+            for (t = 0; t < 5000 && g.state == ST_PLAY; t++) { botTurn(); invariants(i); incDraw(i); }
             turns += g.turn;
             if (g.state == ST_WON) { won++; wturns += g.turn; }
         }

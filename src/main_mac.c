@@ -4,10 +4,11 @@
  * Builds with Retro68 or THINK C. Uses only ROM Toolbox calls: QuickDraw,
  * the Window, Menu and Event Managers. No resources, no C library.
  *
- * Drawing: every screen cell is a 16x16 tile copied with CopyBits from one
- * offscreen strip. Source and destination are both word-aligned, which is
- * the fast path on a 68000. A shadow copy of the screen means only cells
- * that changed are redrawn each turn.
+ * Speed: a turn redraws only the cells that can have changed (the box of
+ * cells the player can see now, plus last turn's box). On a compact Mac the
+ * tiles are written straight into screen memory, sixteen words per tile,
+ * which is far cheaper than a CopyBits call per tile. Set DIRECT_BLIT to 0
+ * to go back to CopyBits if the map ever draws wrongly.
  */
 #include "game.h"
 
@@ -28,18 +29,30 @@
 #define QD(x) qd.x
 #endif
 
+#define DIRECT_BLIT 1
+
 #define WIN_W    512
 #define MAP_H    288            /* 18 rows of 16 pixels */
 #define WIN_H    322            /* map plus a two-line status strip */
 #define MENU_ID  129
+#define STRIP_R  472            /* status text stops here; the compass is right of it */
 
 static WindowPtr gWin;
 static MenuHandle gFileMenu;
 static BitMap gTiles;
 static unsigned short gTileBits[16][T_COUNT];
+static Ptr gMapBase = 0L;       /* screen address of the map's top-left, or 0 */
 static short gShadow[VIEW_H][VIEW_W];
+static short gFull = 1;         /* next map draw must look at every cell */
+static short gBox[4];           /* last turn's redraw box */
+static s32 gViewX, gViewY;
+static unsigned short gRnd = 12345;
 static short gTitle = 1;        /* 1 while the title screen is up */
 static short gQuit = 0;
+
+/* What the status strip currently shows, so only changes are redrawn. */
+static short sAll = 1, sAlarm, sHealth, sLungs;
+static char sItems[64], sMsg[MSG_LEN];
 
 /* ------------------------------------------------------------ text */
 
@@ -49,6 +62,34 @@ static short cLen(const char *s)
     n = 0;
     while (s[n]) n++;
     return n;
+}
+
+static short cSame(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return (short)(*a == *b);
+}
+
+static void cCopy(char *d, const char *s)
+{
+    while (*s) *d++ = *s++;
+    *d = 0;
+}
+
+static void catC(char *d, const char *s)
+{
+    cCopy(d + cLen(d), s);
+}
+
+static void catNum(char *d, long v)
+{
+    char tmp[12];
+    short i, n;
+    i = 0;
+    n = cLen(d);
+    do { tmp[i++] = (char)('0' + (v % 10)); v /= 10; } while (v > 0 && i < 11);
+    while (i > 0) d[n++] = tmp[--i];
+    d[n] = 0;
 }
 
 static void pstr(unsigned char *d, const char *s)
@@ -72,23 +113,12 @@ static void drawCentered(const char *s, short y)
     drawC(s);
 }
 
-static void numToC(char *d, long v)
+static void waitTicks(short n)
 {
-    char tmp[12];
-    short i, n;
-    i = 0;
-    n = 0;
-    do { tmp[i++] = (char)('0' + (v % 10)); v /= 10; } while (v > 0 && i < 11);
-    while (i > 0) d[n++] = tmp[--i];
-    d[n] = 0;
-}
-
-static void catC(char *d, const char *s)
-{
-    short n;
-    n = cLen(d);
-    while (*s) d[n++] = *s++;
-    d[n] = 0;
+    unsigned long until;
+    until = TickCount() + n;
+    while (TickCount() < until)
+        ;
 }
 
 /* ------------------------------------------------------------ tiles */
@@ -115,6 +145,20 @@ static void buildTiles(void)
 static void blitTile(short code, short vx, short vy)
 {
     Rect src, dst;
+    unsigned short *from, *to;
+    short r;
+
+    if (gMapBase) {
+        /* A tile is one 16-bit word per row, and screen rows are 64 bytes. */
+        from = &gTileBits[0][code];
+        to = (unsigned short *)(gMapBase + ((long)vy << 10) + (vx << 1));
+        for (r = 0; r < 16; r++) {
+            *to = *from;
+            from += T_COUNT;
+            to += 32;
+        }
+        return;
+    }
     SetRect(&src, (short)(code * 16), 0, (short)(code * 16 + 16), 16);
     SetRect(&dst, (short)(vx * 16), (short)(vy * 16),
             (short)(vx * 16 + 16), (short)(vy * 16 + 16));
@@ -123,19 +167,36 @@ static void blitTile(short code, short vx, short vy)
 
 static void forgetScreen(void)
 {
-    short vx, vy;
-    for (vy = 0; vy < VIEW_H; vy++)
-        for (vx = 0; vx < VIEW_W; vx++)
-            gShadow[vy][vx] = -1;
+    gFull = 1;
+    sAll = 1;
 }
 
-/* ------------------------------------------------------------ screens */
+/* ------------------------------------------------------------ map */
 
 static void drawMap(void)
 {
-    short vx, vy, code;
-    for (vy = 0; vy < VIEW_H; vy++) {
-        for (vx = 0; vx < VIEW_W; vx++) {
+    short n[4], x0, y0, x1, y1, vx, vy, code, k;
+
+    G_DirtyBox(&n[0], &n[1], &n[2], &n[3]);
+    if (gFull || gViewX != g.viewX || gViewY != g.viewY) {
+        for (vy = 0; vy < VIEW_H; vy++)
+            for (vx = 0; vx < VIEW_W; vx++)
+                gShadow[vy][vx] = -1;
+        x0 = 0; y0 = 0; x1 = VIEW_W - 1; y1 = VIEW_H - 1;
+    } else {
+        x0 = n[0] < gBox[0] ? n[0] : gBox[0];
+        y0 = n[1] < gBox[1] ? n[1] : gBox[1];
+        x1 = n[2] > gBox[2] ? n[2] : gBox[2];
+        y1 = n[3] > gBox[3] ? n[3] : gBox[3];
+    }
+    gBox[0] = n[0]; gBox[1] = n[1]; gBox[2] = n[2]; gBox[3] = n[3];
+    gViewX = g.viewX;
+    gViewY = g.viewY;
+    gFull = 0;
+
+    HideCursor();
+    for (vy = y0; vy <= y1; vy++) {
+        for (vx = x0; vx <= x1; vx++) {
             code = G_Cell(vx, vy);
             if (code != gShadow[vy][vx]) {
                 gShadow[vy][vx] = code;
@@ -143,24 +204,154 @@ static void drawMap(void)
             }
         }
     }
+    /* The storm: a few dust cells somewhere on screen change texture. */
+    for (k = 0; k < 6; k++) {
+        gRnd = (unsigned short)(gRnd * 25173U + 13849U);
+        vx = (short)((gRnd >> 8) & 31);
+        vy = (short)((gRnd >> 3) & 31);
+        if (vy >= VIEW_H) continue;
+        code = gShadow[vy][vx];
+        if (code < T_DUST0 || code > T_DUST2) continue;
+        code++;
+        if (code > T_DUST2) code = T_DUST0;
+        gShadow[vy][vx] = code;
+        blitTile(code, vx, vy);
+    }
+    ShowCursor();
+}
+
+static void flashMap(void)
+{
+    Rect r;
+    SetRect(&r, 0, 0, WIN_W, MAP_H);
+    InvertRect(&r);
+    waitTicks(4);
+    InvertRect(&r);
+}
+
+/* ------------------------------------------------------------ compass */
+
+static void pipRect(short dir, Rect *r)
+{
+    static const short ox[8] = { 0, 8, 11, 8, 0, -8, -11, -8 };
+    static const short oy[8] = { -11, -8, 0, 8, 11, 8, 0, -8 };
+    short cx, cy;
+    cx = (short)(490 + ox[dir]);
+    cy = (short)(MAP_H + 17 + oy[dir]);
+    SetRect(r, (short)(cx - 3), (short)(cy - 3), (short)(cx + 3), (short)(cy + 3));
+}
+
+static void drawCompass(short flash)
+{
+    Rect r;
+    short d, k;
+
+    SetRect(&r, STRIP_R + 1, MAP_H + 1, WIN_W, WIN_H);
+    EraseRect(&r);
+    SetRect(&r, 474, MAP_H + 1, 507, MAP_H + 34);
+    FrameOval(&r);
+    for (d = 0; d < 8; d++) {               /* a small mark at each heading */
+        pipRect(d, &r);
+        InsetRect(&r, 2, 2);
+        PaintRect(&r);
+    }
+    MoveTo(490, MAP_H + 12);                /* north gets a longer tick */
+    LineTo(490, MAP_H + 17);
+    if (gTitle) return;
+
+    pipRect(g.whistleDir, &r);              /* where the whistle last came from */
+    PaintRect(&r);
+    if (flash) {
+        for (k = 0; k < 6; k++) {
+            waitTicks(5);
+            InvertRect(&r);
+        }
+    }
+}
+
+/* ------------------------------------------------------------ status */
+
+static void fieldEnd(Rect *r)
+{
+    if (sAlarm) InvertRect(r);              /* alarm: white on black */
 }
 
 static void drawStatus(void)
 {
-    Rect r;
-    char st[96];
+    Rect r, b;
+    char items[64];
+    short alarm, i, w;
 
-    SetRect(&r, 0, MAP_H, WIN_W, WIN_H);
-    EraseRect(&r);
-    MoveTo(0, MAP_H);
-    LineTo(WIN_W - 1, MAP_H);
-    G_Status(st);
-    TextFace(0);
-    MoveTo(6, MAP_H + 14);
-    drawC(st);
-    MoveTo(6, MAP_H + 28);
-    drawC(g.msg);
+    alarm = (short)(g.state == ST_PLAY && (g.lungs >= 75 || g.health <= 2));
+    if (alarm != sAlarm) { sAlarm = alarm; sAll = 1; }
+
+    if (sAll) {
+        SetRect(&r, 0, MAP_H + 1, STRIP_R, WIN_H);
+        EraseRect(&r);
+        fieldEnd(&r);
+        MoveTo(0, MAP_H);
+        LineTo(WIN_W - 1, MAP_H);
+        drawCompass(0);
+    }
+
+    if (sAll || sHealth != g.health) {
+        sHealth = g.health;
+        SetRect(&r, 4, MAP_H + 3, 104, MAP_H + 17);
+        EraseRect(&r);
+        MoveTo(6, MAP_H + 13);
+        drawC("HEALTH");
+        for (i = 0; i < MAX_HEALTH; i++) {
+            SetRect(&b, (short)(48 + i * 10), MAP_H + 5, (short)(56 + i * 10), MAP_H + 13);
+            if (i < g.health) PaintRect(&b); else FrameRect(&b);
+        }
+        fieldEnd(&r);
+    }
+
+    if (sAll || sLungs != g.lungs) {
+        sLungs = g.lungs;
+        SetRect(&r, 108, MAP_H + 3, 212, MAP_H + 17);
+        EraseRect(&r);
+        MoveTo(110, MAP_H + 13);
+        drawC("LUNGS");
+        SetRect(&b, 146, MAP_H + 5, 208, MAP_H + 13);
+        FrameRect(&b);
+        w = (short)((g.lungs * 60) / 100);
+        if (w > 0) {
+            SetRect(&b, 147, MAP_H + 6, (short)(147 + w), MAP_H + 12);
+            PaintRect(&b);
+        }
+        fieldEnd(&r);
+    }
+
+    items[0] = 0;
+    catC(items, "OIL ");      catNum(items, g.oil);
+    catC(items, "  SHELLS "); catNum(items, g.shells);
+    catC(items, "  RAGS ");   catNum(items, g.rags);
+    catC(items, "  BAND ");   catNum(items, g.bandages);
+    if (g.lamp) catC(items, "  LAMP");
+    if (sAll || !cSame(items, sItems)) {
+        cCopy(sItems, items);
+        SetRect(&r, 214, MAP_H + 3, STRIP_R - 2, MAP_H + 17);
+        EraseRect(&r);
+        MoveTo(216, MAP_H + 13);
+        drawC(items);
+        fieldEnd(&r);
+    }
+
+    if (sAll || !cSame(g.msg, sMsg)) {
+        cCopy(sMsg, g.msg);
+        SetRect(&r, 4, MAP_H + 18, STRIP_R - 2, MAP_H + 33);
+        EraseRect(&r);
+        MoveTo(6, MAP_H + 28);
+        i = cLen(g.msg);
+        if (i > 76) i = 76;
+        DrawText((Ptr)g.msg, 0, i);
+        fieldEnd(&r);
+    }
+    sAll = 0;
 }
+
+/* ------------------------------------------------------------ screens */
 
 static void drawBox(short top, short bottom)
 {
@@ -174,7 +365,7 @@ static void drawBox(short top, short bottom)
 
 static void drawEnd(void)
 {
-    char line[96], num[12];
+    char line[96];
 
     drawBox(96, 192);
     TextFace(1);
@@ -184,8 +375,7 @@ static void drawEnd(void)
                                    : "Harrow keeps what it catches.", 142);
     line[0] = 0;
     catC(line, "You lasted ");
-    numToC(num, g.turn);
-    catC(line, num);
+    catNum(line, g.turn);
     catC(line, " turns.  Press Return to go back in.");
     drawCentered(line, 170);
     forgetScreen();             /* the box covered part of the map */
@@ -193,35 +383,38 @@ static void drawEnd(void)
 
 static void drawTitle(void)
 {
+    Rect r;
     short vx, vy;
 
+    HideCursor();
     for (vy = 0; vy < VIEW_H; vy++)
         for (vx = 0; vx < VIEW_W; vx++)
             blitTile((short)(T_DUST0 + ((vx * 7 + vy * 13) % 3)), vx, vy);
-    drawBox(24, 264);
+    ShowCursor();
+    drawBox(16, 272);
     TextFace(1);
-    drawCentered("B L A C K   S U N D A Y", 52);
+    drawCentered("B L A C K   S U N D A Y", 42);
     TextFace(0);
-    drawCentered("Harrow, Oklahoma.  April, 1935.", 70);
-    drawCentered("The storm has not stopped in nine days. The trains still", 98);
-    drawCentered("run somewhere past the edge of town. Find the depot.", 112);
-    drawCentered("Stay out of the wind when you can.", 126);
-    drawCentered("You are not the only thing moving in it.", 140);
-    drawCentered("Arrow keys or W A S D: walk. Walk into a thing to hit it.", 170);
-    drawCentered("L: lantern (you see farther, and so do they)", 184);
-    drawCentered("F, then a direction: fire the shotgun", 198);
-    drawCentered("R: breathe through a rag    B: bandage    Space: wait", 212);
-    drawCentered("Roofs are shelter. Lungs clear indoors.", 226);
+    drawCentered("Harrow, Oklahoma.  April, 1935.", 58);
+    drawCentered("The storm has not stopped in nine days. The trains still", 82);
+    drawCentered("run somewhere past the edge of town. Find the depot.", 95);
+    drawCentered("When the whistle blows, the compass shows you where.", 108);
+    drawCentered("You are not the only thing moving in the dust.", 121);
+    drawCentered("Arrow keys or W A S D: walk. Walk into a thing to hit it.", 147);
+    drawCentered("R: breathe through a rag (clears your lungs)", 160);
+    drawCentered("B: bandage      Space: wait", 173);
+    drawCentered("L: lantern (you see farther, and so do they)", 186);
+    drawCentered("F, then a direction: fire the shotgun", 199);
+    drawCentered("Roofs are shelter. Lungs clear indoors.", 219);
+    drawCentered("When the bottom of the screen goes black, you are dying.", 232);
     TextFace(1);
-    drawCentered("Press Return to walk out into it.", 250);
+    drawCentered("Press Return to walk out into it.", 258);
     TextFace(0);
-    {
-        Rect r;
-        SetRect(&r, 0, MAP_H, WIN_W, WIN_H);
-        EraseRect(&r);
-        MoveTo(0, MAP_H);
-        LineTo(WIN_W - 1, MAP_H);
-    }
+    SetRect(&r, 0, MAP_H, WIN_W, WIN_H);
+    EraseRect(&r);
+    MoveTo(0, MAP_H);
+    LineTo(WIN_W - 1, MAP_H);
+    drawCompass(0);
     forgetScreen();
 }
 
@@ -238,7 +431,9 @@ static void startGame(void)
 {
     gTitle = 0;
     G_New((u32)TickCount());
+    gRnd = (unsigned short)TickCount();
     drawAll();
+    drawCompass(1);
 }
 
 /* ------------------------------------------------------------ events */
@@ -282,7 +477,9 @@ static void doKey(short c, short mods)
 
     G_Command(cmd);
     drawMap();
+    if (g.hit) flashMap();                  /* you were hurt: the screen says so */
     drawStatus();
+    if (g.whistled && g.state == ST_PLAY) drawCompass(1);
     if (g.state != ST_PLAY) {
         SysBeep(10);
         drawEnd();
@@ -323,6 +520,13 @@ int main(void)
     SetPort(gWin);
     TextFont(4);                /* Monaco 9: fixed width, in the Plus ROM */
     TextSize(9);
+
+    /* Direct drawing only on the screen it was written for: 512 pixels
+       wide, one bit deep, 64 bytes a row. Anything else uses CopyBits. */
+    if (DIRECT_BLIT && QD(screenBits).rowBytes == 64 &&
+        QD(screenBits).bounds.right == 512 && left == 0) {
+        gMapBase = QD(screenBits).baseAddr + (long)top * 64;
+    }
 
     buildTiles();
     drawTitle();

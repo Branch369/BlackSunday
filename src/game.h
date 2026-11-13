@@ -74,6 +74,9 @@ typedef struct {
     s16 fx, fy;             /* facing (last direction tried) */
     s16 health, lungs, oil, shells, rags, bandages;
     s16 lamp, aiming, noise, indoors, vis, storm, state;
+    s16 hit;                /* set when the last command hurt the player   */
+    s16 whistled;           /* set when the last command blew the whistle  */
+    s16 whistleDir;         /* 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW          */
     s32 turn;
     s32 viewX, viewY;       /* world cell at the top-left of the screen */
     s32 inX0, inY0, inX1, inY1;   /* building the player is inside */
@@ -92,6 +95,7 @@ extern const char *gTileArt[T_COUNT][16];
 void G_New(u32 seed);
 void G_Command(s16 cmd);
 s16  G_Cell(s16 vx, s16 vy);        /* tile to draw at a screen cell */
+void G_DirtyBox(s16 *x0, s16 *y0, s16 *x1, s16 *y1);   /* cells that can show something */
 void G_Status(char *buf);           /* one status line, under 80 chars */
 
 /* Exposed for the test harness. */
